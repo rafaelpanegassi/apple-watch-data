@@ -1,0 +1,16 @@
+minio:
+  endpoint: "127.0.0.1:9000"
+  access_key: "minioadmin"
+  secret_key: "minioadminpassword"
+  secure: false
+  buckets:
+    bronze: "bronze"
+    silver: "silver"
+
+postgres:
+  host: "127.0.0.1"
+  port: 5432
+  db: "health_analytics"
+  user: "postgres"
+  password: "postgrespassword"
+  schema: "gold"
