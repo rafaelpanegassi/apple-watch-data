@@ -57,7 +57,7 @@ for obj in objects:
 # %%
 query_hr = f"""
     SELECT creation_date, value, unit, source_name 
-    FROM read_parquet('s3://{settings.bucket_silver}/records_type=heart_rate/*.parquet') 
+    FROM read_parquet('s3://{settings.bucket_silver}/records_type=heart_rate/**/*.parquet') 
     LIMIT 10
 """
 conn.execute(query_hr).df()
@@ -71,7 +71,7 @@ query_oxygen = f"""
         CAST(start_date AS DATE) as data,
         ROUND(AVG(value) * 100, 2) as avg_oxygen_percentage,
         COUNT(*) as leituras
-    FROM read_parquet('s3://{settings.bucket_silver}/records_type=blood_oxygen/*.parquet')
+    FROM read_parquet('s3://{settings.bucket_silver}/records_type=blood_oxygen/**/*.parquet')
     GROUP BY 1
     ORDER BY 1 DESC
     LIMIT 10
@@ -87,7 +87,7 @@ query_resp = f"""
         MIN(value) as min_respiratory_rate,
         MAX(value) as max_respiratory_rate,
         ROUND(AVG(value), 1) as avg_respiratory_rate
-    FROM read_parquet('s3://{settings.bucket_silver}/records_type=respiratory_rate/*.parquet')
+    FROM read_parquet('s3://{settings.bucket_silver}/records_type=respiratory_rate/**/*.parquet')
 """
 conn.execute(query_resp).df()
 
@@ -101,7 +101,7 @@ query_workouts = f"""
         COUNT(*) as total_treinos,
         ROUND(AVG(duration), 1) as duracao_media_min,
         ROUND(SUM(total_energy_burned), 0) as calorias_totais_burned_kcal
-    FROM read_parquet('s3://{settings.bucket_silver}/workouts/*.parquet')
+    FROM read_parquet('s3://{settings.bucket_silver}/workouts/**/*.parquet')
     GROUP BY 1
     ORDER BY 2 DESC
 """
@@ -116,7 +116,7 @@ query_custom = f"""
     SELECT 
         type,
         COUNT(*) as total_records
-    FROM read_parquet('s3://{settings.bucket_silver}/records_type=*/*.parquet')
+    FROM read_parquet('s3://{settings.bucket_silver}/records_type=*/**/*.parquet')
     GROUP BY 1
     ORDER BY 2 DESC
 """
