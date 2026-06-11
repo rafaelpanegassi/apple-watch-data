@@ -7,7 +7,6 @@ from src.utils.minio_client import get_minio_client
 
 
 def setup_duckdb_s3(conn: duckdb.DuckDBPyConnection) -> None:
-    """Configures DuckDB to connect to local MinIO (S3 compatible object storage)."""
     conn.execute("INSTALL httpfs;")
     conn.execute("LOAD httpfs;")
     conn.execute(f"SET s3_endpoint='{settings.minio_endpoint}';")
@@ -17,25 +16,23 @@ def setup_duckdb_s3(conn: duckdb.DuckDBPyConnection) -> None:
     conn.execute("SET s3_url_style='path';")
 
 
-def check_files_exist(prefix: str) -> bool:
-    """Checks if there are any objects in the Silver bucket matching the prefix."""
+def check_files_exist(user_id: str, prefix: str) -> bool:
     client = get_minio_client()
     try:
-        objects = client.list_objects(settings.bucket_silver, prefix=prefix, recursive=True)
+        objects = client.list_objects(settings.bucket_silver, prefix=f"{user_id}/{prefix}", recursive=True)
         return any(objects)
     except Exception as e:
-        logger.error(f"Error checking objects in bucket '{settings.bucket_silver}' with prefix '{prefix}': {e}")
+        logger.error(f"Error checking objects in bucket '{settings.bucket_silver}' with prefix '{user_id}/{prefix}': {e}")
         return False
 
 
-def aggregate_heart_rate(duck_conn) -> None:
-    """Aggregates Heart Rate silver data and writes to Postgres daily summary table."""
+def aggregate_heart_rate(duck_conn, user_id: str) -> None:
     prefix = "records_type=heart_rate"
-    if not check_files_exist(prefix):
-        logger.warning(f"No silver Parquet files found for heart rate ('{prefix}'). Skipping HR aggregation.")
+    if not check_files_exist(user_id, prefix):
+        logger.warning(f"No silver Parquet files found for heart rate ('{user_id}/{prefix}'). Skipping HR aggregation.")
         return
 
-    logger.info("Aggregating daily heart rate statistics...")
+    logger.info(f"Aggregating daily heart rate statistics for user {user_id}...")
     query = f"""
         SELECT 
             CAST(start_date AS DATE) as date,
@@ -43,25 +40,24 @@ def aggregate_heart_rate(duck_conn) -> None:
             MIN(value) as min_heart_rate,
             MAX(value) as max_heart_rate,
             COUNT(value)::INTEGER as records_count
-        FROM read_parquet('s3://{settings.bucket_silver}/{prefix}/**/*.parquet')
+        FROM read_parquet('s3://{settings.bucket_silver}/{user_id}/{prefix}/**/*.parquet')
         GROUP BY 1
         ORDER BY 1
     """
     res = duck_conn.execute(query).arrow().read_all().to_pylist()
 
     if not res:
-        logger.warning("No heart rate data yielded from query.")
+        logger.warning(f"No heart rate data yielded from query for user {user_id}.")
         return
-
 
     pg_conn = get_db_connection()
     try:
         with pg_conn.cursor() as cur:
             insert_query = f"""
                 INSERT INTO {settings.db_schema}.daily_heart_rate_summary 
-                (date, avg_heart_rate, min_heart_rate, max_heart_rate, records_count)
+                (user_id, date, avg_heart_rate, min_heart_rate, max_heart_rate, records_count)
                 VALUES %s
-                ON CONFLICT (date) DO UPDATE SET
+                ON CONFLICT (user_id, date) DO UPDATE SET
                     avg_heart_rate = EXCLUDED.avg_heart_rate,
                     min_heart_rate = EXCLUDED.min_heart_rate,
                     max_heart_rate = EXCLUDED.max_heart_rate,
@@ -69,22 +65,21 @@ def aggregate_heart_rate(duck_conn) -> None:
                     updated_at = CURRENT_TIMESTAMP
             """
             rows = [
-                (r["date"], r["avg_heart_rate"], r["min_heart_rate"], r["max_heart_rate"], int(r["records_count"]))
+                (user_id, r["date"], r["avg_heart_rate"], r["min_heart_rate"], r["max_heart_rate"], int(r["records_count"]))
                 for r in res
             ]
             execute_values(cur, insert_query, rows)
             pg_conn.commit()
-            logger.info(f"Upserted {len(rows)} records into Postgres table 'daily_heart_rate_summary'.")
+            logger.info(f"Upserted {len(rows)} records into Postgres table 'daily_heart_rate_summary' for user {user_id}.")
     except Exception as e:
         pg_conn.rollback()
-        logger.error(f"Failed to upsert heart rate summaries: {e}")
+        logger.error(f"Failed to upsert heart rate summaries for user {user_id}: {e}")
         raise e
     finally:
         pg_conn.close()
 
 
-def aggregate_activity(duck_conn) -> None:
-    """Aggregates Step Count, active/basal energy and distance into daily activity summary."""
+def aggregate_activity(duck_conn, user_id: str) -> None:
     prefixes = [
         "records_type=step_count",
         "records_type=active_energy",
@@ -92,12 +87,12 @@ def aggregate_activity(duck_conn) -> None:
         "records_type=distance"
     ]
 
-    active_prefixes = [p for p in prefixes if check_files_exist(p)]
+    active_prefixes = [p for p in prefixes if check_files_exist(user_id, p)]
     if not active_prefixes:
-        logger.warning("No silver Parquet files found for any activity metrics. Skipping Activity aggregation.")
+        logger.warning(f"No silver Parquet files found for any activity metrics for user {user_id}. Skipping Activity aggregation.")
         return
 
-    logger.info("Aggregating daily activity metrics...")
+    logger.info(f"Aggregating daily activity metrics for user {user_id}...")
 
     cte_defs = []
 
@@ -113,7 +108,7 @@ def aggregate_activity(duck_conn) -> None:
                         WHEN source_name = 'Zepp' THEN 2
                         ELSE 3
                     END as priority
-                FROM read_parquet('s3://{settings.bucket_silver}/records_type=step_count/**/*.parquet')
+                FROM read_parquet('s3://{settings.bucket_silver}/{user_id}/records_type=step_count/**/*.parquet')
             ),
             steps AS (
                 SELECT CAST(start_date AS DATE) as date, SUM(value) as step_count
@@ -142,7 +137,7 @@ def aggregate_activity(duck_conn) -> None:
                         WHEN source_name = 'Zepp' THEN 2
                         ELSE 3
                     END as priority
-                FROM read_parquet('s3://{settings.bucket_silver}/records_type=active_energy/**/*.parquet')
+                FROM read_parquet('s3://{settings.bucket_silver}/{user_id}/records_type=active_energy/**/*.parquet')
             ),
             active_energy AS (
                 SELECT CAST(start_date AS DATE) as date, SUM(value) as active_energy_kcal
@@ -171,7 +166,7 @@ def aggregate_activity(duck_conn) -> None:
                         WHEN source_name = 'Zepp' THEN 2
                         ELSE 3
                     END as priority
-                FROM read_parquet('s3://{settings.bucket_silver}/records_type=basal_energy/**/*.parquet')
+                FROM read_parquet('s3://{settings.bucket_silver}/{user_id}/records_type=basal_energy/**/*.parquet')
             ),
             basal_energy AS (
                 SELECT CAST(start_date AS DATE) as date, SUM(value) as basal_energy_kcal
@@ -200,7 +195,7 @@ def aggregate_activity(duck_conn) -> None:
                         WHEN source_name = 'Zepp' THEN 2
                         ELSE 3
                     END as priority
-                FROM read_parquet('s3://{settings.bucket_silver}/records_type=distance/**/*.parquet')
+                FROM read_parquet('s3://{settings.bucket_silver}/{user_id}/records_type=distance/**/*.parquet')
             ),
             distance AS (
                 SELECT CAST(start_date AS DATE) as date, SUM(value) as distance_km
@@ -237,18 +232,17 @@ def aggregate_activity(duck_conn) -> None:
     res = duck_conn.execute(query).arrow().read_all().to_pylist()
 
     if not res:
-        logger.warning("No activity data yielded from query.")
+        logger.warning(f"No activity data yielded from query for user {user_id}.")
         return
-
 
     pg_conn = get_db_connection()
     try:
         with pg_conn.cursor() as cur:
             insert_query = f"""
                 INSERT INTO {settings.db_schema}.daily_activity_summary 
-                (date, step_count, active_energy_kcal, basal_energy_kcal, distance_km)
+                (user_id, date, step_count, active_energy_kcal, basal_energy_kcal, distance_km)
                 VALUES %s
-                ON CONFLICT (date) DO UPDATE SET
+                ON CONFLICT (user_id, date) DO UPDATE SET
                     step_count = EXCLUDED.step_count,
                     active_energy_kcal = EXCLUDED.active_energy_kcal,
                     basal_energy_kcal = EXCLUDED.basal_energy_kcal,
@@ -256,28 +250,27 @@ def aggregate_activity(duck_conn) -> None:
                     updated_at = CURRENT_TIMESTAMP
             """
             rows = [
-                (r["date"], r["step_count"], r["active_energy_kcal"], r["basal_energy_kcal"], r["distance_km"])
+                (user_id, r["date"], r["step_count"], r["active_energy_kcal"], r["basal_energy_kcal"], r["distance_km"])
                 for r in res
             ]
             execute_values(cur, insert_query, rows)
             pg_conn.commit()
-            logger.info(f"Upserted {len(rows)} records into Postgres table 'daily_activity_summary'.")
+            logger.info(f"Upserted {len(rows)} records into Postgres table 'daily_activity_summary' for user {user_id}.")
     except Exception as e:
         pg_conn.rollback()
-        logger.error(f"Failed to upsert activity summaries: {e}")
+        logger.error(f"Failed to upsert activity summaries for user {user_id}: {e}")
         raise e
     finally:
         pg_conn.close()
 
 
-def aggregate_workouts(duck_conn) -> None:
-    """Aggregates Workout data and writes to Postgres workouts summary table."""
+def aggregate_workouts(duck_conn, user_id: str) -> None:
     prefix = "workouts"
-    if not check_files_exist(prefix):
-        logger.warning(f"No silver Parquet files found for workouts ('{prefix}'). Skipping workout aggregation.")
+    if not check_files_exist(user_id, prefix):
+        logger.warning(f"No silver Parquet files found for workouts ('{user_id}/{prefix}'). Skipping workout aggregation.")
         return
 
-    logger.info("Aggregating workouts...")
+    logger.info(f"Aggregating workouts for user {user_id}...")
     query = f"""
         SELECT 
             workout_type,
@@ -286,25 +279,24 @@ def aggregate_workouts(duck_conn) -> None:
             first(duration) as duration_minutes,
             first(total_energy_burned) as total_energy_kcal,
             first(total_distance) as total_distance_km
-        FROM read_parquet('s3://{settings.bucket_silver}/{prefix}/**/*.parquet')
+        FROM read_parquet('s3://{settings.bucket_silver}/{user_id}/{prefix}/**/*.parquet')
         GROUP BY workout_type, start_date
         ORDER BY start_date
     """
     res = duck_conn.execute(query).arrow().read_all().to_pylist()
 
     if not res:
-        logger.warning("No workout data yielded from query.")
+        logger.warning(f"No workout data yielded from query for user {user_id}.")
         return
-
 
     pg_conn = get_db_connection()
     try:
         with pg_conn.cursor() as cur:
             insert_query = f"""
                 INSERT INTO {settings.db_schema}.workouts_summary 
-                (workout_type, start_date, end_date, duration_minutes, total_energy_kcal, total_distance_km)
+                (user_id, workout_type, start_date, end_date, duration_minutes, total_energy_kcal, total_distance_km)
                 VALUES %s
-                ON CONFLICT (workout_type, start_date) DO UPDATE SET
+                ON CONFLICT (user_id, workout_type, start_date) DO UPDATE SET
                     end_date = EXCLUDED.end_date,
                     duration_minutes = EXCLUDED.duration_minutes,
                     total_energy_kcal = EXCLUDED.total_energy_kcal,
@@ -313,6 +305,7 @@ def aggregate_workouts(duck_conn) -> None:
             """
             rows = [
                 (
+                    user_id,
                     r["workout_type"],
                     r["start_date"],
                     r["end_date"],
@@ -324,23 +317,22 @@ def aggregate_workouts(duck_conn) -> None:
             ]
             execute_values(cur, insert_query, rows)
             pg_conn.commit()
-            logger.info(f"Upserted {len(rows)} records into Postgres table 'workouts_summary'.")
+            logger.info(f"Upserted {len(rows)} records into Postgres table 'workouts_summary' for user {user_id}.")
     except Exception as e:
         pg_conn.rollback()
-        logger.error(f"Failed to upsert workout summaries: {e}")
+        logger.error(f"Failed to upsert workout summaries for user {user_id}: {e}")
         raise e
     finally:
         pg_conn.close()
 
 
-def aggregate_sleep(duck_conn) -> None:
-    """Aggregates Sleep duration by stage and writes to Postgres daily sleep summary table."""
+def aggregate_sleep(duck_conn, user_id: str) -> None:
     prefix = "records_type=sleep"
-    if not check_files_exist(prefix):
-        logger.warning(f"No silver Parquet files found for sleep ('{prefix}'). Skipping sleep aggregation.")
+    if not check_files_exist(user_id, prefix):
+        logger.warning(f"No silver Parquet files found for sleep ('{user_id}/{prefix}'). Skipping sleep aggregation.")
         return
 
-    logger.info("Aggregating daily sleep duration by stage...")
+    logger.info(f"Aggregating daily sleep duration by stage for user {user_id}...")
 
     query = f"""
         SELECT 
@@ -350,25 +342,24 @@ def aggregate_sleep(duck_conn) -> None:
             SUM(CASE WHEN value = 3.0 THEN (epoch(end_date) - epoch(start_date)) / 60.0 ELSE 0.0 END) as light_min,
             SUM(CASE WHEN value = 4.0 THEN (epoch(end_date) - epoch(start_date)) / 60.0 ELSE 0.0 END) as rem_min,
             SUM(CASE WHEN value = 5.0 THEN (epoch(end_date) - epoch(start_date)) / 60.0 ELSE 0.0 END) as awake_min
-        FROM read_parquet('s3://{settings.bucket_silver}/{prefix}/**/*.parquet')
+        FROM read_parquet('s3://{settings.bucket_silver}/{user_id}/{prefix}/**/*.parquet')
         GROUP BY 1
         ORDER BY 1
     """
     res = duck_conn.execute(query).arrow().read_all().to_pylist()
 
     if not res:
-        logger.warning("No sleep data yielded from query.")
+        logger.warning(f"No sleep data yielded from query for user {user_id}.")
         return
-
 
     pg_conn = get_db_connection()
     try:
         with pg_conn.cursor() as cur:
             insert_query = f"""
                 INSERT INTO {settings.db_schema}.daily_sleep_summary 
-                (date, total_sleep_minutes, asleep_minutes, deep_sleep_minutes, light_sleep_minutes, rem_sleep_minutes, awake_minutes)
+                (user_id, date, total_sleep_minutes, asleep_minutes, deep_sleep_minutes, light_sleep_minutes, rem_sleep_minutes, awake_minutes)
                 VALUES %s
-                ON CONFLICT (date) DO UPDATE SET
+                ON CONFLICT (user_id, date) DO UPDATE SET
                     total_sleep_minutes = EXCLUDED.total_sleep_minutes,
                     asleep_minutes = EXCLUDED.asleep_minutes,
                     deep_sleep_minutes = EXCLUDED.deep_sleep_minutes,
@@ -385,40 +376,39 @@ def aggregate_sleep(duck_conn) -> None:
                 rem = r["rem_min"] or 0.0
                 awake = r["awake_min"] or 0.0
                 total = asleep + deep + light + rem
-                rows.append((r["date"], total, asleep, deep, light, rem, awake))
+                rows.append((user_id, r["date"], total, asleep, deep, light, rem, awake))
 
             execute_values(cur, insert_query, rows)
             pg_conn.commit()
-            logger.info(f"Upserted {len(rows)} records into Postgres table 'daily_sleep_summary'.")
+            logger.info(f"Upserted {len(rows)} records into Postgres table 'daily_sleep_summary' for user {user_id}.")
     except Exception as e:
         pg_conn.rollback()
-        logger.error(f"Failed to upsert sleep summaries: {e}")
+        logger.error(f"Failed to upsert sleep summaries for user {user_id}: {e}")
         raise e
     finally:
         pg_conn.close()
 
 
-def aggregate_cardiovascular(duck_conn) -> None:
-    """Aggregates cardiovascular health indicators (resting hr, hrv, vo2_max, blood_oxygen)."""
+def aggregate_cardiovascular(duck_conn, user_id: str) -> None:
     prefixes = [
         "records_type=resting_heart_rate",
         "records_type=hrv",
         "records_type=vo2_max",
         "records_type=blood_oxygen"
     ]
-    active_prefixes = [p for p in prefixes if check_files_exist(p)]
+    active_prefixes = [p for p in prefixes if check_files_exist(user_id, p)]
     if not active_prefixes:
-        logger.warning("No cardiovascular metrics parquets found. Skipping cardio aggregation.")
+        logger.warning(f"No cardiovascular metrics parquets found for user {user_id}. Skipping cardio aggregation.")
         return
 
-    logger.info("Aggregating daily cardiovascular indicators...")
+    logger.info(f"Aggregating daily cardiovascular indicators for user {user_id}...")
 
     cte_defs = []
     if "records_type=resting_heart_rate" in active_prefixes:
         cte_defs.append(f"""
             resting AS (
                 SELECT CAST(start_date AS DATE) as date, AVG(value) as resting_hr
-                FROM read_parquet('s3://{settings.bucket_silver}/records_type=resting_heart_rate/**/*.parquet')
+                FROM read_parquet('s3://{settings.bucket_silver}/{user_id}/records_type=resting_heart_rate/**/*.parquet')
                 GROUP BY 1
             )
         """)
@@ -429,7 +419,7 @@ def aggregate_cardiovascular(duck_conn) -> None:
         cte_defs.append(f"""
             hrv AS (
                 SELECT CAST(start_date AS DATE) as date, AVG(value) as hrv_val
-                FROM read_parquet('s3://{settings.bucket_silver}/records_type=hrv/**/*.parquet')
+                FROM read_parquet('s3://{settings.bucket_silver}/{user_id}/records_type=hrv/**/*.parquet')
                 GROUP BY 1
             )
         """)
@@ -440,7 +430,7 @@ def aggregate_cardiovascular(duck_conn) -> None:
         cte_defs.append(f"""
             vo2 AS (
                 SELECT CAST(start_date AS DATE) as date, AVG(value) as vo2_max_val
-                FROM read_parquet('s3://{settings.bucket_silver}/records_type=vo2_max/**/*.parquet')
+                FROM read_parquet('s3://{settings.bucket_silver}/{user_id}/records_type=vo2_max/**/*.parquet')
                 GROUP BY 1
             )
         """)
@@ -451,7 +441,7 @@ def aggregate_cardiovascular(duck_conn) -> None:
         cte_defs.append(f"""
             ox AS (
                 SELECT CAST(start_date AS DATE) as date, AVG(value) as ox_avg, MIN(value) as ox_min
-                FROM read_parquet('s3://{settings.bucket_silver}/records_type=blood_oxygen/**/*.parquet')
+                FROM read_parquet('s3://{settings.bucket_silver}/{user_id}/records_type=blood_oxygen/**/*.parquet')
                 GROUP BY 1
             )
         """)
@@ -479,18 +469,17 @@ def aggregate_cardiovascular(duck_conn) -> None:
     res = duck_conn.execute(query).arrow().read_all().to_pylist()
 
     if not res:
-        logger.warning("No cardiovascular data yielded from query.")
+        logger.warning(f"No cardiovascular data yielded from query for user {user_id}.")
         return
-
 
     pg_conn = get_db_connection()
     try:
         with pg_conn.cursor() as cur:
             insert_query = f"""
                 INSERT INTO {settings.db_schema}.daily_cardiovascular_summary 
-                (date, avg_resting_heart_rate, avg_hrv_sdnn, avg_vo2_max, avg_blood_oxygen, min_blood_oxygen)
+                (user_id, date, avg_resting_heart_rate, avg_hrv_sdnn, avg_vo2_max, avg_blood_oxygen, min_blood_oxygen)
                 VALUES %s
-                ON CONFLICT (date) DO UPDATE SET
+                ON CONFLICT (user_id, date) DO UPDATE SET
                     avg_resting_heart_rate = EXCLUDED.avg_resting_heart_rate,
                     avg_hrv_sdnn = EXCLUDED.avg_hrv_sdnn,
                     avg_vo2_max = EXCLUDED.avg_vo2_max,
@@ -499,32 +488,31 @@ def aggregate_cardiovascular(duck_conn) -> None:
                     updated_at = CURRENT_TIMESTAMP
             """
             rows = [
-                (r["date"], r["resting_hr"], r["hrv_sdnn"], r["vo2_max"], r["blood_oxygen_avg"], r["blood_oxygen_min"])
+                (user_id, r["date"], r["resting_hr"], r["hrv_sdnn"], r["vo2_max"], r["blood_oxygen_avg"], r["blood_oxygen_min"])
                 for r in res
             ]
             execute_values(cur, insert_query, rows)
             pg_conn.commit()
-            logger.info(f"Upserted {len(rows)} records into Postgres table 'daily_cardiovascular_summary'.")
+            logger.info(f"Upserted {len(rows)} records into Postgres table 'daily_cardiovascular_summary' for user {user_id}.")
     except Exception as e:
         pg_conn.rollback()
-        logger.error(f"Failed to upsert cardiovascular summaries: {e}")
+        logger.error(f"Failed to upsert cardiovascular summaries for user {user_id}: {e}")
         raise e
     finally:
         pg_conn.close()
 
 
-def aggregate_respiratory(duck_conn) -> None:
-    """Aggregates daily respiratory status (respiratory rate, disturbances)."""
+def aggregate_respiratory(duck_conn, user_id: str) -> None:
     prefixes = [
         "records_type=respiratory_rate",
         "records_type=breathing_disturbances"
     ]
-    active_prefixes = [p for p in prefixes if check_files_exist(p)]
+    active_prefixes = [p for p in prefixes if check_files_exist(user_id, p)]
     if not active_prefixes:
-        logger.warning("No respiratory metrics parquets found. Skipping respiratory aggregation.")
+        logger.warning(f"No respiratory metrics parquets found for user {user_id}. Skipping respiratory aggregation.")
         return
 
-    logger.info("Aggregating daily respiratory status...")
+    logger.info(f"Aggregating daily respiratory status for user {user_id}...")
 
     cte_defs = []
     if "records_type=respiratory_rate" in active_prefixes:
@@ -535,7 +523,7 @@ def aggregate_respiratory(duck_conn) -> None:
                     AVG(value) as avg_resp,
                     MIN(value) as min_resp,
                     MAX(value) as max_resp
-                FROM read_parquet('s3://{settings.bucket_silver}/records_type=respiratory_rate/**/*.parquet')
+                FROM read_parquet('s3://{settings.bucket_silver}/{user_id}/records_type=respiratory_rate/**/*.parquet')
                 GROUP BY 1
             )
         """)
@@ -546,7 +534,7 @@ def aggregate_respiratory(duck_conn) -> None:
         cte_defs.append(f"""
             disturb AS (
                 SELECT CAST(start_date AS DATE) as date, AVG(value) as avg_dist
-                FROM read_parquet('s3://{settings.bucket_silver}/records_type=breathing_disturbances/**/*.parquet')
+                FROM read_parquet('s3://{settings.bucket_silver}/{user_id}/records_type=breathing_disturbances/**/*.parquet')
                 GROUP BY 1
             )
         """)
@@ -571,18 +559,17 @@ def aggregate_respiratory(duck_conn) -> None:
     res = duck_conn.execute(query).arrow().read_all().to_pylist()
 
     if not res:
-        logger.warning("No respiratory data yielded from query.")
+        logger.warning(f"No respiratory data yielded from query for user {user_id}.")
         return
-
 
     pg_conn = get_db_connection()
     try:
         with pg_conn.cursor() as cur:
             insert_query = f"""
                 INSERT INTO {settings.db_schema}.daily_respiratory_summary 
-                (date, avg_respiratory_rate, min_respiratory_rate, max_respiratory_rate, avg_breathing_disturbances)
+                (user_id, date, avg_respiratory_rate, min_respiratory_rate, max_respiratory_rate, avg_breathing_disturbances)
                 VALUES %s
-                ON CONFLICT (date) DO UPDATE SET
+                ON CONFLICT (user_id, date) DO UPDATE SET
                     avg_respiratory_rate = EXCLUDED.avg_respiratory_rate,
                     min_respiratory_rate = EXCLUDED.min_respiratory_rate,
                     max_respiratory_rate = EXCLUDED.max_respiratory_rate,
@@ -590,22 +577,21 @@ def aggregate_respiratory(duck_conn) -> None:
                     updated_at = CURRENT_TIMESTAMP
             """
             rows = [
-                (r["date"], r["avg_respiratory_rate"], r["min_respiratory_rate"], r["max_respiratory_rate"], r["avg_breathing_disturbances"])
+                (user_id, r["date"], r["avg_respiratory_rate"], r["min_respiratory_rate"], r["max_respiratory_rate"], r["avg_breathing_disturbances"])
                 for r in res
             ]
             execute_values(cur, insert_query, rows)
             pg_conn.commit()
-            logger.info(f"Upserted {len(rows)} records into Postgres table 'daily_respiratory_summary'.")
+            logger.info(f"Upserted {len(rows)} records into Postgres table 'daily_respiratory_summary' for user {user_id}.")
     except Exception as e:
         pg_conn.rollback()
-        logger.error(f"Failed to upsert respiratory summaries: {e}")
+        logger.error(f"Failed to upsert respiratory summaries for user {user_id}: {e}")
         raise e
     finally:
         pg_conn.close()
 
 
-def aggregate_metrics(duck_conn) -> None:
-    """Aggregates physical measurements, environmental, and stand attributes daily."""
+def aggregate_metrics(duck_conn, user_id: str) -> None:
     prefixes = [
         "records_type=body_mass",
         "records_type=flights_climbed",
@@ -616,12 +602,12 @@ def aggregate_metrics(duck_conn) -> None:
         "records_type=stand_hour",
         "records_type=physical_effort"
     ]
-    active_prefixes = [p for p in prefixes if check_files_exist(p)]
+    active_prefixes = [p for p in prefixes if check_files_exist(user_id, p)]
     if not active_prefixes:
-        logger.warning("No physical, stand, or environmental metrics parquets found. Skipping metrics aggregation.")
+        logger.warning(f"No physical, stand, or environmental metrics parquets found for user {user_id}. Skipping metrics aggregation.")
         return
 
-    logger.info("Aggregating daily physical and environmental metrics...")
+    logger.info(f"Aggregating daily physical and environmental metrics for user {user_id}...")
 
     cte_defs = []
 
@@ -629,7 +615,7 @@ def aggregate_metrics(duck_conn) -> None:
         cte_defs.append(f"""
             bm AS (
                 SELECT CAST(start_date AS DATE) as date, AVG(value) as val
-                FROM read_parquet('s3://{settings.bucket_silver}/records_type=body_mass/**/*.parquet')
+                FROM read_parquet('s3://{settings.bucket_silver}/{user_id}/records_type=body_mass/**/*.parquet')
                 GROUP BY 1
             )
         """)
@@ -648,7 +634,7 @@ def aggregate_metrics(duck_conn) -> None:
                         WHEN source_name = 'Zepp' THEN 2
                         ELSE 3
                     END as priority
-                FROM read_parquet('s3://{settings.bucket_silver}/records_type=flights_climbed/**/*.parquet')
+                FROM read_parquet('s3://{settings.bucket_silver}/{user_id}/records_type=flights_climbed/**/*.parquet')
             ),
             fc AS (
                 SELECT CAST(start_date AS DATE) as date, SUM(value) as val
@@ -669,7 +655,7 @@ def aggregate_metrics(duck_conn) -> None:
         cte_defs.append(f"""
             dl AS (
                 SELECT CAST(start_date AS DATE) as date, SUM(value) as val
-                FROM read_parquet('s3://{settings.bucket_silver}/records_type=time_in_daylight/**/*.parquet')
+                FROM read_parquet('s3://{settings.bucket_silver}/{user_id}/records_type=time_in_daylight/**/*.parquet')
                 GROUP BY 1
             )
         """)
@@ -680,7 +666,7 @@ def aggregate_metrics(duck_conn) -> None:
         cte_defs.append(f"""
             ws AS (
                 SELECT CAST(start_date AS DATE) as date, AVG(value) as val
-                FROM read_parquet('s3://{settings.bucket_silver}/records_type=walking_speed/**/*.parquet')
+                FROM read_parquet('s3://{settings.bucket_silver}/{user_id}/records_type=walking_speed/**/*.parquet')
                 GROUP BY 1
             )
         """)
@@ -691,7 +677,7 @@ def aggregate_metrics(duck_conn) -> None:
         cte_defs.append(f"""
             wt AS (
                 SELECT CAST(start_date AS DATE) as date, AVG(value) as val
-                FROM read_parquet('s3://{settings.bucket_silver}/records_type=wrist_temperature/**/*.parquet')
+                FROM read_parquet('s3://{settings.bucket_silver}/{user_id}/records_type=wrist_temperature/**/*.parquet')
                 GROUP BY 1
             )
         """)
@@ -702,7 +688,7 @@ def aggregate_metrics(duck_conn) -> None:
         cte_defs.append(f"""
             et AS (
                 SELECT CAST(start_date AS DATE) as date, SUM(value) as val
-                FROM read_parquet('s3://{settings.bucket_silver}/records_type=exercise_time/**/*.parquet')
+                FROM read_parquet('s3://{settings.bucket_silver}/{user_id}/records_type=exercise_time/**/*.parquet')
                 GROUP BY 1
             )
         """)
@@ -712,9 +698,8 @@ def aggregate_metrics(duck_conn) -> None:
     if "records_type=stand_hour" in active_prefixes:
         cte_defs.append(f"""
             sh AS (
-                -- Stand Hour values: 0 = stood up, 1 = sat/didn't stand
                 SELECT CAST(start_date AS DATE) as date, COUNT(DISTINCT start_date) as val
-                FROM read_parquet('s3://{settings.bucket_silver}/records_type=stand_hour/**/*.parquet')
+                FROM read_parquet('s3://{settings.bucket_silver}/{user_id}/records_type=stand_hour/**/*.parquet')
                 WHERE value = 0.0
                 GROUP BY 1
             )
@@ -726,7 +711,7 @@ def aggregate_metrics(duck_conn) -> None:
         cte_defs.append(f"""
             pe AS (
                 SELECT CAST(start_date AS DATE) as date, AVG(value) as val
-                FROM read_parquet('s3://{settings.bucket_silver}/records_type=physical_effort/**/*.parquet')
+                FROM read_parquet('s3://{settings.bucket_silver}/{user_id}/records_type=physical_effort/**/*.parquet')
                 GROUP BY 1
             )
         """)
@@ -761,18 +746,17 @@ def aggregate_metrics(duck_conn) -> None:
     res = duck_conn.execute(query).arrow().read_all().to_pylist()
 
     if not res:
-        logger.warning("No metrics data yielded from query.")
+        logger.warning(f"No metrics data yielded from query for user {user_id}.")
         return
-
 
     pg_conn = get_db_connection()
     try:
         with pg_conn.cursor() as cur:
             insert_query = f"""
                 INSERT INTO {settings.db_schema}.daily_metrics_summary 
-                (date, body_mass_kg, flights_climbed, time_in_daylight_minutes, avg_walking_speed_kmh, avg_wrist_temperature_c, exercise_time_minutes, stand_hours, avg_physical_effort)
+                (user_id, date, body_mass_kg, flights_climbed, time_in_daylight_minutes, avg_walking_speed_kmh, avg_wrist_temperature_c, exercise_time_minutes, stand_hours, avg_physical_effort)
                 VALUES %s
-                ON CONFLICT (date) DO UPDATE SET
+                ON CONFLICT (user_id, date) DO UPDATE SET
                     body_mass_kg = EXCLUDED.body_mass_kg,
                     flights_climbed = EXCLUDED.flights_climbed,
                     time_in_daylight_minutes = EXCLUDED.time_in_daylight_minutes,
@@ -785,6 +769,7 @@ def aggregate_metrics(duck_conn) -> None:
             """
             rows = [
                 (
+                    user_id,
                     r["date"],
                     r["body_mass_kg"],
                     r["flights_climbed"],
@@ -799,34 +784,27 @@ def aggregate_metrics(duck_conn) -> None:
             ]
             execute_values(cur, insert_query, rows)
             pg_conn.commit()
-            logger.info(f"Upserted {len(rows)} records into Postgres table 'daily_metrics_summary'.")
+            logger.info(f"Upserted {len(rows)} records into Postgres table 'daily_metrics_summary' for user {user_id}.")
     except Exception as e:
         pg_conn.rollback()
-        logger.error(f"Failed to upsert physical metrics summaries: {e}")
+        logger.error(f"Failed to upsert physical metrics summaries for user {user_id}: {e}")
         raise e
     finally:
         pg_conn.close()
 
 
-def process_gold() -> None:
-    """Orchestrates Gold schema creation, aggregates data in DuckDB, and loads Postgres."""
+def process_gold(user_id: str) -> None:
     init_db_schema()
 
     duck_conn = duckdb.connect()
     setup_duckdb_s3(duck_conn)
 
-    aggregate_heart_rate(duck_conn)
-    aggregate_activity(duck_conn)
-    aggregate_workouts(duck_conn)
+    aggregate_heart_rate(duck_conn, user_id)
+    aggregate_activity(duck_conn, user_id)
+    aggregate_workouts(duck_conn, user_id)
+    aggregate_sleep(duck_conn, user_id)
+    aggregate_cardiovascular(duck_conn, user_id)
+    aggregate_respiratory(duck_conn, user_id)
+    aggregate_metrics(duck_conn, user_id)
 
-
-    aggregate_sleep(duck_conn)
-    aggregate_cardiovascular(duck_conn)
-    aggregate_respiratory(duck_conn)
-    aggregate_metrics(duck_conn)
-
-    logger.info("Gold layer loading complete.")
-
-
-if __name__ == "__main__":
-    process_gold()
+    logger.info(f"Gold layer loading complete for user {user_id}.")

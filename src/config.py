@@ -7,6 +7,19 @@ from loguru import logger
 class Settings:
     def __init__(self):
         self.project_root = Path(__file__).resolve().parent.parent
+        env_path = self.project_root / ".env"
+        if env_path.exists():
+            with open(env_path, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if "=" in line:
+                        k, v = line.split("=", 1)
+                        k = k.strip()
+                        v = v.strip().strip("'").strip('"')
+                        os.environ[k] = v
+
         config_path = self.project_root / "config" / "settings.yaml"
 
         self.config_data = {}

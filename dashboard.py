@@ -3,8 +3,10 @@ import pandas as pd
 import psycopg2
 import ollama
 import requests
+import hashlib
+import os
+from pathlib import Path
 from src.config import settings
-
 
 st.set_page_config(
     page_title="Apple Watch Analytics & AI Coach",
@@ -13,10 +15,8 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-
 st.markdown("""
 <style>
-    /* Premium visual overrides */
     .stApp {
         background-color: #0d0f12;
         color: #e2e8f0;
@@ -62,8 +62,6 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-
-@st.cache_resource
 def get_db_conn():
     try:
         conn = psycopg2.connect(
@@ -79,7 +77,6 @@ def get_db_conn():
         return None
 
 
-
 def query_db(sql: str, params=None):
     conn = get_db_conn()
     if conn is None:
@@ -90,7 +87,8 @@ def query_db(sql: str, params=None):
     except Exception as e:
         st.error(f"Database Query Error: {e}")
         return pd.DataFrame()
-
+    finally:
+        conn.close()
 
 
 def call_llm(provider, system_content, user_content, ollama_url, model_name, groq_key, groq_model):
@@ -127,36 +125,137 @@ def call_llm(provider, system_content, user_content, ollama_url, model_name, gro
         return resp.json()['choices'][0]['message']['content']
 
 
+def hash_password(password: str) -> str:
+    return hashlib.sha256(password.encode()).hexdigest()
+
+
+def register_user(username, password):
+    conn = get_db_conn()
+    if not conn:
+        return False, "Database connection error."
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT username FROM gold.users WHERE username = %s", (username,))
+            if cur.fetchone():
+                return False, "Username already exists."
+            h = hash_password(password)
+            cur.execute("INSERT INTO gold.users (username, password_hash) VALUES (%s, %s)", (username, h))
+            conn.commit()
+            return True, "User registered successfully!"
+    except Exception as e:
+        conn.rollback()
+        return False, f"Error registering user: {e}"
+    finally:
+        conn.close()
+
+
+def authenticate_user(username, password):
+    conn = get_db_conn()
+    if not conn:
+        return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT password_hash FROM gold.users WHERE username = %s", (username,))
+            row = cur.fetchone()
+            if row and row[0] == hash_password(password):
+                return True
+            return False
+    except Exception:
+        return False
+    finally:
+        conn.close()
+
+
+if "user_id" not in st.session_state:
+    st.session_state.user_id = None
+
+if not st.session_state.user_id:
+    st.markdown('<div class="main-header" style="text-align: center;">Welcome to Health Coach MVP</div>', unsafe_allow_html=True)
+    st.markdown('<div class="sub-header" style="text-align: center;">Please register or login to view your personal dashboard</div>', unsafe_allow_html=True)
+
+    mode = st.radio("Choose Action", ["Login", "Register"], horizontal=True)
+    username = st.text_input("Username")
+    password = st.text_input("Password", type="password")
+
+    if st.button("Submit"):
+        if not username or not password:
+            st.error("Please fill in all fields.")
+        elif mode == "Register":
+            success, msg = register_user(username, password)
+            if success:
+                st.success(msg)
+            else:
+                st.error(msg)
+        elif mode == "Login":
+            if authenticate_user(username, password):
+                st.session_state.user_id = username
+                st.success(f"Logged in as {username}!")
+                st.rerun()
+            else:
+                st.error("Invalid username or password.")
+    st.stop()
+
 
 with st.sidebar:
     st.image("https://img.icons8.com/fluent/144/000000/apple-watch.png", width=70)
     st.markdown("### Data Product Hub")
+    st.markdown(f"Logged in as: `{st.session_state.user_id}`")
 
+    if st.button("Logout"):
+        st.session_state.user_id = None
+        st.session_state.messages = []
+        st.rerun()
 
-    conn = get_db_conn()
-    if conn:
-        st.success("Postgres: Connected ✅")
-    else:
-        st.error("Postgres: Offline ❌")
+    st.markdown("---")
+    st.markdown("### Upload Health Export")
+    uploaded_file = st.file_uploader("Upload export.zip", type=["zip"])
+    if uploaded_file is not None:
+        if st.button("Process Data"):
+            temp_dir = Path("data/tmp_uploads")
+            temp_dir.mkdir(parents=True, exist_ok=True)
+            temp_zip_path = temp_dir / f"{st.session_state.user_id}_export.zip"
+
+            with open(temp_zip_path, "wb") as f:
+                f.write(uploaded_file.getbuffer())
+
+            with st.spinner("Processing Apple Watch data..."):
+                try:
+                    from src.bronze.raw_loader import load_bronze
+                    from src.silver.xml_parser import process_silver
+                    from src.gold.aggregator import process_gold
+
+                    st.info("Ingesting raw ZIP...")
+                    load_bronze(st.session_state.user_id, str(temp_zip_path))
+
+                    st.info("Parsing XML (Bronze -> Silver)...")
+                    process_silver(st.session_state.user_id)
+
+                    st.info("Aggregating daily summaries (Silver -> Gold)...")
+                    process_gold(st.session_state.user_id)
+
+                    st.success("Data processed successfully!")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Error processing data: {e}")
+                finally:
+                    if temp_zip_path.exists():
+                        os.remove(temp_zip_path)
 
     st.markdown("---")
     st.markdown("### AI Engine Settings")
-    ai_provider = st.radio("Select AI Provider", ["Local Ollama", "Groq API (Free Cloud)"])
+    ai_provider = st.radio("Select AI Provider", ["Local Ollama", "Groq API (Free Cloud)"], index=1)
 
     ollama_url = "http://localhost:11434"
     model_name = "llama3"
-    groq_key = ""
+    env_groq_key = os.getenv("GROQ_API") or os.getenv("GROQ_API_KEY") or ""
+    groq_key = env_groq_key
     groq_model = "llama-3.3-70b-versatile"
 
     if ai_provider == "Local Ollama":
         ollama_url = st.text_input("Ollama Endpoint", value="http://localhost:11434")
         model_name = st.text_input("LLM Model Name", value="llama3")
-        st.markdown("""
-        > **Ollama Setup:** Ensure the Ollama container is running and execute:
-        > `docker exec -it apple_watch_ollama ollama pull llama3`
-        """)
     else:
-        groq_key = st.text_input("Groq API Key", type="password", help="Get a free key at console.groq.com")
+        groq_key = st.text_input("Groq API Key", value=env_groq_key, type="password", help="Get a free key at console.groq.com")
         st.markdown("[Get a free Groq API Key](https://console.groq.com/keys)")
         groq_model = st.selectbox("Groq Model", [
             "llama-3.3-70b-versatile", 
@@ -166,20 +265,15 @@ with st.sidebar:
         ])
 
 
-
 st.markdown('<div class="main-header">Apple Watch Health Warehouse</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-header">Premium analytics dashboard with local Ollama or Cloud Groq AI Health Insights</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-header">Premium analytics dashboard with Cloud Groq or Local Ollama AI Health Insights</div>', unsafe_allow_html=True)
 
-
-
-df_sleep = query_db("SELECT * FROM gold.daily_sleep_summary ORDER BY date DESC")
-df_activity = query_db("SELECT * FROM gold.daily_activity_summary ORDER BY date DESC")
-df_workouts = query_db("SELECT * FROM gold.workouts_summary ORDER BY start_date DESC")
-df_cardio = query_db("SELECT * FROM gold.daily_cardiovascular_summary ORDER BY date DESC")
-df_resp = query_db("SELECT * FROM gold.daily_respiratory_summary ORDER BY date DESC")
-df_metrics = query_db("SELECT * FROM gold.daily_metrics_summary ORDER BY date DESC")
-
-
+df_sleep = query_db("SELECT * FROM gold.daily_sleep_summary WHERE user_id = %s ORDER BY date DESC", (st.session_state.user_id,))
+df_activity = query_db("SELECT * FROM gold.daily_activity_summary WHERE user_id = %s ORDER BY date DESC", (st.session_state.user_id,))
+df_workouts = query_db("SELECT * FROM gold.workouts_summary WHERE user_id = %s ORDER BY start_date DESC", (st.session_state.user_id,))
+df_cardio = query_db("SELECT * FROM gold.daily_cardiovascular_summary WHERE user_id = %s ORDER BY date DESC", (st.session_state.user_id,))
+df_resp = query_db("SELECT * FROM gold.daily_respiratory_summary WHERE user_id = %s ORDER BY date DESC", (st.session_state.user_id,))
+df_metrics = query_db("SELECT * FROM gold.daily_metrics_summary WHERE user_id = %s ORDER BY date DESC", (st.session_state.user_id,))
 
 tab_overview, tab_sleep, tab_activity, tab_cardio_resp, tab_workouts, tab_ai = st.tabs([
     "📊 Overview & KPIs", 
@@ -190,18 +284,12 @@ tab_overview, tab_sleep, tab_activity, tab_cardio_resp, tab_workouts, tab_ai = s
     "🧠 AI Health Coach"
 ])
 
-
-
-
-
 with tab_overview:
     if not df_activity.empty:
-
         latest_act = df_activity.iloc[0]
         steps = int(latest_act['step_count'])
         active_kcal = float(latest_act['active_energy_kcal'])
         dist = float(latest_act['distance_km'])
-
 
         sleep_dur = 0.0
         sleep_status = "No Data"
@@ -210,13 +298,11 @@ with tab_overview:
             sleep_dur = float(latest_sleep['total_sleep_minutes']) / 60.0
             sleep_status = f"{sleep_dur:.1f} hrs"
 
-
         resting_hr = 0.0
         if not df_cardio.empty:
             latest_cardio = df_cardio.iloc[0]
             if latest_cardio['avg_resting_heart_rate'] is not None:
                 resting_hr = float(latest_cardio['avg_resting_heart_rate'])
-
 
         st.markdown("### Latest Daily Metrics Summary")
         col1, col2, col3, col4 = st.columns(4)
@@ -243,7 +329,6 @@ with tab_overview:
                 delta_color="inverse"
             )
 
-
         st.markdown("### Weekly Performance Comparison")
         c1, c2 = st.columns(2)
         with c1:
@@ -267,10 +352,7 @@ with tab_overview:
             else:
                 st.info("No sleep stages data available.")
     else:
-        st.warning("No activity records available. Run pipeline ingestion first.")
-
-
-
+        st.warning("No activity records available. Please upload your export.zip file in the sidebar to populate the database.")
 
 
 with tab_sleep:
@@ -290,7 +372,6 @@ with tab_sleep:
             st.write(f"- 💤 **Light Sleep:** {avg_light:.1f} minutes ({avg_light / 60:.1f} hrs)")
             st.write(f"- 🧠 **REM Sleep:** {avg_rem:.1f} minutes ({avg_rem / 60:.1f} hrs)")
             st.write(f"- ⏰ **Awake Time:** {avg_awake:.1f} minutes ({avg_awake / 60:.1f} hrs)")
-
 
             if avg_total >= 7.5:
                 st.success("Target sleep met! You're consistently getting 7.5+ hours of sleep.")
@@ -313,9 +394,6 @@ with tab_sleep:
         st.dataframe(df_sleep, use_container_width=True)
     else:
         st.warning("No sleep records available.")
-
-
-
 
 
 with tab_activity:
@@ -347,9 +425,6 @@ with tab_activity:
             st.info("No detailed physical metrics summary table populated.")
     else:
         st.warning("No activity records available.")
-
-
-
 
 
 with tab_cardio_resp:
@@ -397,9 +472,6 @@ with tab_cardio_resp:
         st.info("No respiratory summary records available.")
 
 
-
-
-
 with tab_workouts:
     st.markdown("### Historical Workouts & Training")
     if not df_workouts.empty:
@@ -426,13 +498,9 @@ with tab_workouts:
         st.warning("No workouts records available.")
 
 
-
-
-
 with tab_ai:
     st.markdown('### Apple Watch AI Assistant <span class="ai-badge">AI Health Coach</span>', unsafe_allow_html=True)
     st.markdown("Engage with your health LLM coach. It will analyze your health metrics and provide recommendations.")
-
 
     context_str = ""
     if not df_activity.empty:
@@ -462,10 +530,8 @@ with tab_ai:
         for _, row in recent_wk.iterrows():
             context_str += f"- Type: {row['workout_type']} | Date: {row['start_date']} | Duration: {row['duration_minutes']:.1f}m | Energy: {row['total_energy_kcal']:.1f} kcal | Distance: {row['total_distance_km']:.1f} km\n"
 
-
     if "messages" not in st.session_state:
         st.session_state.messages = []
-
 
     if st.button("Generate Weekly Health Report"):
         report_prompt = f"""
@@ -501,17 +567,14 @@ with tab_ai:
                 else:
                     st.info("Check your API key and internet connection.")
 
-
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
             st.write(msg["content"])
-
 
     if prompt := st.chat_input("Ask a question about your health data..."):
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.write(prompt)
-
 
         full_prompt = f"""
         User Health Context (Last 7 Days):

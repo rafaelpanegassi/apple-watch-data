@@ -68,19 +68,37 @@ def write_partitioned_batch(records: list, schema: pa.Schema, root_path: Path) -
     pq.write_to_dataset(table, root_path=str(root_path), partition_cols=["date"])
 
 
-def process_silver() -> None:
+def safe_rmtree(path: Path) -> None:
+    if not path.exists():
+        return
+    for i in range(5):
+        try:
+            shutil.rmtree(path)
+            return
+        except Exception as e:
+            if i == 4:
+                if os.name != 'nt':
+                    import subprocess
+                    subprocess.run(["rm", "-rf", str(path)], check=False)
+                    if not path.exists():
+                        return
+                raise e
+            import time
+            time.sleep(0.2)
+
+
+def process_silver(user_id: str) -> None:
     project_root = Path(__file__).resolve().parent.parent.parent
     data_dir = (project_root / "data").resolve()
-    tmp_dir = data_dir / "tmp_processing"
+    tmp_dir = data_dir / "tmp_processing" / user_id
     current_time = datetime.utcnow()
 
-    if tmp_dir.exists():
-        shutil.rmtree(tmp_dir)
+    safe_rmtree(tmp_dir)
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
     local_zip = tmp_dir / "apple_health_raw.zip"
-    logger.info("Downloading raw export ZIP from MinIO Bronze...")
-    download_file(settings.bucket_bronze, "apple_health_raw.zip", str(local_zip))
+    logger.info(f"Downloading raw export ZIP from MinIO Bronze for user {user_id}...")
+    download_file(settings.bucket_bronze, f"{user_id}/apple_health_raw.zip", str(local_zip))
 
     logger.info("Extracting ZIP safely...")
     safe_extract_zip(local_zip, extract_dir := tmp_dir / "extracted")
@@ -280,14 +298,26 @@ def process_silver() -> None:
                     continue
 
                 date_str = date_dir.name.split("=")[1]
-                minio_prefix = f"{mapped_type}/date={date_str}/"
+                minio_prefix = f"{user_id}/{mapped_type}/date={date_str}/"
                 try:
                     objects = list(minio_client.list_objects(settings.bucket_silver, prefix=minio_prefix, recursive=True))
                 except Exception as e:
                     logger.warning(f"Failed to list objects for {minio_prefix}: {e}")
                     objects = []
 
-                new_df = pq.read_table(str(date_dir)).to_pandas()
+                parquet_files = list(date_dir.glob("*.parquet"))
+                if not parquet_files:
+                    continue
+
+                dfs = []
+                for pf in parquet_files:
+                    try:
+                        dfs.append(pq.read_table(str(pf)).to_pandas())
+                    except Exception as e:
+                        logger.warning(f"Failed to read parquet file {pf}: {e}")
+                if not dfs:
+                    continue
+                new_df = pd.concat(dfs, ignore_index=True)
                 if "date" not in new_df.columns:
                     new_df["date"] = date_str
                 else:
@@ -357,7 +387,7 @@ def process_silver() -> None:
                     except Exception as e:
                         logger.error(f"Failed to delete {obj.object_name}: {e}")
 
-                target_object_name = f"{mapped_type}/date={date_str}/part_0.parquet"
+                target_object_name = f"{user_id}/{mapped_type}/date={date_str}/part_0.parquet"
                 try:
                     minio_client.fput_object(settings.bucket_silver, target_object_name, str(final_local_path))
                 except Exception as e:
@@ -372,7 +402,7 @@ def process_silver() -> None:
                 gc.collect()
 
     logger.info(f"Silver processing complete! Uploaded tables to MinIO bucket '{settings.bucket_silver}' with date partitioning and metadata columns.")
-    shutil.rmtree(tmp_dir)
+    safe_rmtree(tmp_dir)
 
 
 if __name__ == "__main__":
