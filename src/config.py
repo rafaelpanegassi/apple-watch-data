@@ -1,6 +1,7 @@
 import os
 from pathlib import Path
 import yaml
+from loguru import logger
 
 
 class Settings:
@@ -8,16 +9,14 @@ class Settings:
         self.project_root = Path(__file__).resolve().parent.parent
         config_path = self.project_root / "config" / "settings.yaml"
 
-        # Load file configs if exists
         self.config_data = {}
         if config_path.exists():
             with open(config_path, "r") as f:
                 try:
                     self.config_data = yaml.safe_load(f) or {}
                 except Exception as e:
-                    print(f"Warning: Failed to parse settings.yaml: {e}")
+                    logger.warning(f"Failed to parse settings.yaml: {e}")
 
-        # MinIO Config
         minio_section = self.config_data.get("minio", {})
         self.minio_endpoint = os.getenv(
             "MINIO_ENDPOINT", minio_section.get("endpoint", "127.0.0.1:9000")
@@ -40,7 +39,6 @@ class Settings:
             "MINIO_BUCKET_SILVER", buckets.get("silver", "silver")
         )
 
-        # Postgres Config
         postgres_section = self.config_data.get("postgres", {})
         self.db_host = os.getenv("DB_HOST", postgres_section.get("host", "127.0.0.1"))
         self.db_port = int(

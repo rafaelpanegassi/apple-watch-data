@@ -53,7 +53,7 @@ def aggregate_heart_rate(duck_conn) -> None:
         logger.warning("No heart rate data yielded from query.")
         return
 
-    # Load into Postgres
+
     pg_conn = get_db_connection()
     try:
         with pg_conn.cursor() as cur:
@@ -91,7 +91,7 @@ def aggregate_activity(duck_conn) -> None:
         "records_type=basal_energy",
         "records_type=distance"
     ]
-    
+
     active_prefixes = [p for p in prefixes if check_files_exist(p)]
     if not active_prefixes:
         logger.warning("No silver Parquet files found for any activity metrics. Skipping Activity aggregation.")
@@ -100,7 +100,7 @@ def aggregate_activity(duck_conn) -> None:
     logger.info("Aggregating daily activity metrics...")
 
     cte_defs = []
-    
+
     if "records_type=step_count" in active_prefixes:
         cte_defs.append(f"""
             steps_raw AS (
@@ -240,7 +240,7 @@ def aggregate_activity(duck_conn) -> None:
         logger.warning("No activity data yielded from query.")
         return
 
-    # Load into Postgres
+
     pg_conn = get_db_connection()
     try:
         with pg_conn.cursor() as cur:
@@ -296,7 +296,7 @@ def aggregate_workouts(duck_conn) -> None:
         logger.warning("No workout data yielded from query.")
         return
 
-    # Load into Postgres
+
     pg_conn = get_db_connection()
     try:
         with pg_conn.cursor() as cur:
@@ -341,7 +341,7 @@ def aggregate_sleep(duck_conn) -> None:
         return
 
     logger.info("Aggregating daily sleep duration by stage...")
-    # Sleep value mapping: 1.0=asleep, 2.0=deep, 3.0=light, 4.0=rem, 5.0=awake, 0.0=in_bed/other
+
     query = f"""
         SELECT 
             CAST(start_date AS DATE) as date,
@@ -360,7 +360,7 @@ def aggregate_sleep(duck_conn) -> None:
         logger.warning("No sleep data yielded from query.")
         return
 
-    # Load into Postgres
+
     pg_conn = get_db_connection()
     try:
         with pg_conn.cursor() as cur:
@@ -412,7 +412,7 @@ def aggregate_cardiovascular(duck_conn) -> None:
         return
 
     logger.info("Aggregating daily cardiovascular indicators...")
-    
+
     cte_defs = []
     if "records_type=resting_heart_rate" in active_prefixes:
         cte_defs.append(f"""
@@ -482,7 +482,7 @@ def aggregate_cardiovascular(duck_conn) -> None:
         logger.warning("No cardiovascular data yielded from query.")
         return
 
-    # Load into Postgres
+
     pg_conn = get_db_connection()
     try:
         with pg_conn.cursor() as cur:
@@ -525,7 +525,7 @@ def aggregate_respiratory(duck_conn) -> None:
         return
 
     logger.info("Aggregating daily respiratory status...")
-    
+
     cte_defs = []
     if "records_type=respiratory_rate" in active_prefixes:
         cte_defs.append(f"""
@@ -574,7 +574,7 @@ def aggregate_respiratory(duck_conn) -> None:
         logger.warning("No respiratory data yielded from query.")
         return
 
-    # Load into Postgres
+
     pg_conn = get_db_connection()
     try:
         with pg_conn.cursor() as cur:
@@ -622,9 +622,9 @@ def aggregate_metrics(duck_conn) -> None:
         return
 
     logger.info("Aggregating daily physical and environmental metrics...")
-    
+
     cte_defs = []
-    
+
     if "records_type=body_mass" in active_prefixes:
         cte_defs.append(f"""
             bm AS (
@@ -764,7 +764,7 @@ def aggregate_metrics(duck_conn) -> None:
         logger.warning("No metrics data yielded from query.")
         return
 
-    # Load into Postgres
+
     pg_conn = get_db_connection()
     try:
         with pg_conn.cursor() as cur:
@@ -818,8 +818,8 @@ def process_gold() -> None:
     aggregate_heart_rate(duck_conn)
     aggregate_activity(duck_conn)
     aggregate_workouts(duck_conn)
-    
-    # New rich summaries
+
+
     aggregate_sleep(duck_conn)
     aggregate_cardiovascular(duck_conn)
     aggregate_respiratory(duck_conn)

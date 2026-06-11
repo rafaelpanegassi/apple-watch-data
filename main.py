@@ -32,15 +32,15 @@ def main():
         elif args.stage == "all":
             logger.info("Executing Bronze Loader (1/3)...")
             load_bronze()
-            
+
             logger.info("Executing Silver XML Parser (2/3)...")
             process_silver()
-            
+
             logger.info("Executing Gold Aggregator (3/3)...")
             process_gold()
-            
+
         logger.info("Pipeline Execution Completed Successfully.")
-        
+
     except Exception as e:
         logger.critical(f"Pipeline execution failed: {e}")
         sys.exit(1)

@@ -2,10 +2,10 @@ import streamlit as st
 import pandas as pd
 import psycopg2
 import ollama
-from datetime import datetime, timedelta
+import requests
 from src.config import settings
 
-# Page Configuration
+
 st.set_page_config(
     page_title="Apple Watch Analytics & AI Coach",
     page_icon="⌚",
@@ -13,7 +13,7 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Custom Styling (Dark Mode Theme with Apple-style accent colors)
+
 st.markdown("""
 <style>
     /* Premium visual overrides */
@@ -62,7 +62,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-# Database connection helper
+
 @st.cache_resource
 def get_db_conn():
     try:
@@ -79,7 +79,7 @@ def get_db_conn():
         return None
 
 
-# Helper to run database queries
+
 def query_db(sql: str, params=None):
     conn = get_db_conn()
     if conn is None:
@@ -92,35 +92,86 @@ def query_db(sql: str, params=None):
         return pd.DataFrame()
 
 
-# Sidebar Configurations
+
+def call_llm(provider, system_content, user_content, ollama_url, model_name, groq_key, groq_model):
+    if provider == "Local Ollama":
+        client = ollama.Client(host=ollama_url)
+        response = client.chat(
+            model=model_name,
+            messages=[
+                {"role": "system", "content": system_content},
+                {"role": "user", "content": user_content}
+            ]
+        )
+        return response['message']['content']
+
+    elif provider == "Groq API (Free Cloud)":
+        if not groq_key:
+            raise ValueError("Please enter your Groq API Key in the sidebar.")
+        url = "https://api.groq.com/openai/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {groq_key}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "model": groq_model,
+            "messages": [
+                {"role": "system", "content": system_content},
+                {"role": "user", "content": user_content}
+            ],
+            "temperature": 0.3
+        }
+        resp = requests.post(url, json=payload, headers=headers)
+        if resp.status_code != 200:
+            raise Exception(f"Groq API Error ({resp.status_code}): {resp.text}")
+        return resp.json()['choices'][0]['message']['content']
+
+
+
 with st.sidebar:
     st.image("https://img.icons8.com/fluent/144/000000/apple-watch.png", width=70)
     st.markdown("### Data Product Hub")
-    
-    # DB Status check
+
+
     conn = get_db_conn()
     if conn:
         st.success("Postgres: Connected ✅")
     else:
         st.error("Postgres: Offline ❌")
-        
+
     st.markdown("---")
-    st.markdown("### AI Engine (Ollama)")
-    ollama_url = st.text_input("Ollama Endpoint", value="http://localhost:11434")
-    model_name = st.text_input("LLM Model Name", value="llama3")
-    
-    st.markdown("""
-    > **Note:** Ensure Ollama is running locally and you have pulled the model using:
-    > `ollama run llama3` (or any other model).
-    """)
+    st.markdown("### AI Engine Settings")
+    ai_provider = st.radio("Select AI Provider", ["Local Ollama", "Groq API (Free Cloud)"])
+
+    ollama_url = "http://localhost:11434"
+    model_name = "llama3"
+    groq_key = ""
+    groq_model = "llama-3.3-70b-versatile"
+
+    if ai_provider == "Local Ollama":
+        ollama_url = st.text_input("Ollama Endpoint", value="http://localhost:11434")
+        model_name = st.text_input("LLM Model Name", value="llama3")
+        st.markdown("""
+        > **Ollama Setup:** Ensure the Ollama container is running and execute:
+        > `docker exec -it apple_watch_ollama ollama pull llama3`
+        """)
+    else:
+        groq_key = st.text_input("Groq API Key", type="password", help="Get a free key at console.groq.com")
+        st.markdown("[Get a free Groq API Key](https://console.groq.com/keys)")
+        groq_model = st.selectbox("Groq Model", [
+            "llama-3.3-70b-versatile", 
+            "llama-3.1-8b-instant", 
+            "mixtral-8x7b-32768", 
+            "gemma2-9b-it"
+        ])
 
 
-# Header Section
+
 st.markdown('<div class="main-header">Apple Watch Health Warehouse</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-header">Premium analytics dashboard with local Ollama AI Health Insights</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-header">Premium analytics dashboard with local Ollama or Cloud Groq AI Health Insights</div>', unsafe_allow_html=True)
 
 
-# Load data from Gold tables
+
 df_sleep = query_db("SELECT * FROM gold.daily_sleep_summary ORDER BY date DESC")
 df_activity = query_db("SELECT * FROM gold.daily_activity_summary ORDER BY date DESC")
 df_workouts = query_db("SELECT * FROM gold.workouts_summary ORDER BY start_date DESC")
@@ -129,7 +180,7 @@ df_resp = query_db("SELECT * FROM gold.daily_respiratory_summary ORDER BY date D
 df_metrics = query_db("SELECT * FROM gold.daily_metrics_summary ORDER BY date DESC")
 
 
-# Define Tabs
+
 tab_overview, tab_sleep, tab_activity, tab_cardio_resp, tab_workouts, tab_ai = st.tabs([
     "📊 Overview & KPIs", 
     "💤 Sleep & Recovery", 
@@ -140,36 +191,36 @@ tab_overview, tab_sleep, tab_activity, tab_cardio_resp, tab_workouts, tab_ai = s
 ])
 
 
-# ==========================================
-# TAB 1: OVERVIEW & KPIS
-# ==========================================
+
+
+
 with tab_overview:
     if not df_activity.empty:
-        # Get latest day values
+
         latest_act = df_activity.iloc[0]
         steps = int(latest_act['step_count'])
         active_kcal = float(latest_act['active_energy_kcal'])
         dist = float(latest_act['distance_km'])
-        
-        # Calculate Sleep for latest day
+
+
         sleep_dur = 0.0
         sleep_status = "No Data"
         if not df_sleep.empty:
             latest_sleep = df_sleep.iloc[0]
             sleep_dur = float(latest_sleep['total_sleep_minutes']) / 60.0
             sleep_status = f"{sleep_dur:.1f} hrs"
-            
-        # Resting Heart Rate
+
+
         resting_hr = 0.0
         if not df_cardio.empty:
             latest_cardio = df_cardio.iloc[0]
             if latest_cardio['avg_resting_heart_rate'] is not None:
                 resting_hr = float(latest_cardio['avg_resting_heart_rate'])
 
-        # Display KPIs
+
         st.markdown("### Latest Daily Metrics Summary")
         col1, col2, col3, col4 = st.columns(4)
-        
+
         with col1:
             st.metric(
                 label="Steps Today", 
@@ -192,7 +243,7 @@ with tab_overview:
                 delta_color="inverse"
             )
 
-        # Charts Section
+
         st.markdown("### Weekly Performance Comparison")
         c1, c2 = st.columns(2)
         with c1:
@@ -200,7 +251,7 @@ with tab_overview:
             df_chart_steps = df_activity.head(14).copy()
             df_chart_steps = df_chart_steps.sort_values('date')
             st.bar_chart(data=df_chart_steps, x='date', y='step_count', color="#10b981")
-            
+
         with c2:
             st.markdown("#### Sleep Stages Trend (Last 14 Days)")
             if not df_sleep.empty:
@@ -219,9 +270,9 @@ with tab_overview:
         st.warning("No activity records available. Run pipeline ingestion first.")
 
 
-# ==========================================
-# TAB 2: SLEEP & RECOVERY
-# ==========================================
+
+
+
 with tab_sleep:
     st.markdown("### Sleep Stages & Recovery Quality")
     if not df_sleep.empty:
@@ -233,22 +284,22 @@ with tab_sleep:
             avg_light = df_sleep['light_sleep_minutes'].mean()
             avg_rem = df_sleep['rem_sleep_minutes'].mean()
             avg_awake = df_sleep['awake_minutes'].mean()
-            
+
             st.metric("Avg Sleep Duration", f"{avg_total:.1f} hours")
             st.write(f"- 🛌 **Deep Sleep:** {avg_deep:.1f} minutes ({avg_deep / 60:.1f} hrs)")
             st.write(f"- 💤 **Light Sleep:** {avg_light:.1f} minutes ({avg_light / 60:.1f} hrs)")
             st.write(f"- 🧠 **REM Sleep:** {avg_rem:.1f} minutes ({avg_rem / 60:.1f} hrs)")
             st.write(f"- ⏰ **Awake Time:** {avg_awake:.1f} minutes ({avg_awake / 60:.1f} hrs)")
-            
-            # Simple assessment
+
+
             if avg_total >= 7.5:
                 st.success("Target sleep met! You're consistently getting 7.5+ hours of sleep.")
             else:
                 st.warning("Sleep duration is below recommended 7-8 hours. Focus on sleep hygiene.")
-                
+
         with col_s2:
             st.markdown("#### Sleep Stages Ratio Over Time")
-            # Select specific sleep fields
+
             df_sleep_pct = df_sleep.copy()
             df_sleep_pct = df_sleep_pct.sort_values('date')
             df_sleep_pct['date'] = df_sleep_pct['date'].astype(str)
@@ -257,16 +308,16 @@ with tab_sleep:
                 x='date', 
                 y=['deep_sleep_minutes', 'light_sleep_minutes', 'rem_sleep_minutes']
             )
-            
+
         st.markdown("#### Sleep Details Table")
         st.dataframe(df_sleep, use_container_width=True)
     else:
         st.warning("No sleep records available.")
 
 
-# ==========================================
-# TAB 3: ACTIVITY TRENDS
-# ==========================================
+
+
+
 with tab_activity:
     st.markdown("### Daily Activity & Energy Burned")
     if not df_activity.empty:
@@ -288,7 +339,7 @@ with tab_activity:
                 y='distance_km',
                 color="#0066cc"
             )
-            
+
         st.markdown("#### Physical Measurements & Stand Statistics")
         if not df_metrics.empty:
             st.dataframe(df_metrics, use_container_width=True)
@@ -298,12 +349,12 @@ with tab_activity:
         st.warning("No activity records available.")
 
 
-# ==========================================
-# TAB 4: CARDIO & RESPIRATORY
-# ==========================================
+
+
+
 with tab_cardio_resp:
     st.markdown("### Cardiovascular & Respiratory Analytics")
-    
+
     col_c1, col_c2 = st.columns(2)
     with col_c1:
         st.markdown("#### Heart Rate Variability (SDNN) & Resting HR")
@@ -317,7 +368,7 @@ with tab_cardio_resp:
             )
         else:
             st.info("No cardiovascular data available.")
-            
+
     with col_c2:
         st.markdown("#### Blood Oxygen Saturation & VO2 Max")
         if not df_cardio.empty and 'avg_blood_oxygen' in df_cardio.columns:
@@ -346,9 +397,9 @@ with tab_cardio_resp:
         st.info("No respiratory summary records available.")
 
 
-# ==========================================
-# TAB 5: WORKOUTS LOG
-# ==========================================
+
+
+
 with tab_workouts:
     st.markdown("### Historical Workouts & Training")
     if not df_workouts.empty:
@@ -357,17 +408,17 @@ with tab_workouts:
             st.markdown("#### Workout Types Distribution")
             type_counts = df_workouts['workout_type'].value_counts()
             st.bar_chart(type_counts)
-            
+
             st.markdown("#### Training Statistics Summary")
             total_duration = df_workouts['duration_minutes'].sum()
             avg_duration = df_workouts['duration_minutes'].mean()
             total_burned = df_workouts['total_energy_kcal'].sum()
-            
+
             st.metric("Total Workout Hours", f"{total_duration/60:.1f} hrs")
             st.metric("Total Energy Burned", f"{total_burned:,.1f} kcal")
             st.write(f"- 🚶 **Average duration:** {avg_duration:.1f} minutes")
             st.write(f"- 🏋️ **Workout Count:** {len(df_workouts)} sessions")
-            
+
         with col_w2:
             st.markdown("#### Workouts Log List")
             st.dataframe(df_workouts, use_container_width=True)
@@ -375,14 +426,14 @@ with tab_workouts:
         st.warning("No workouts records available.")
 
 
-# ==========================================
-# TAB 6: AI HEALTH COACH (OLLAMA)
-# ==========================================
-with tab_ai:
-    st.markdown('### Apple Watch AI Assistant <span class="ai-badge">LOCAL LLM</span>', unsafe_allow_html=True)
-    st.markdown("Engage with your local health LLM coach. It will analyze your health metrics and provide recommendations.")
 
-    # 1. Gather recent 7-day health metrics for LLM Context
+
+
+with tab_ai:
+    st.markdown('### Apple Watch AI Assistant <span class="ai-badge">AI Health Coach</span>', unsafe_allow_html=True)
+    st.markdown("Engage with your health LLM coach. It will analyze your health metrics and provide recommendations.")
+
+
     context_str = ""
     if not df_activity.empty:
         recent_act = df_activity.head(7)
@@ -411,11 +462,11 @@ with tab_ai:
         for _, row in recent_wk.iterrows():
             context_str += f"- Type: {row['workout_type']} | Date: {row['start_date']} | Duration: {row['duration_minutes']:.1f}m | Energy: {row['total_energy_kcal']:.1f} kcal | Distance: {row['total_distance_km']:.1f} km\n"
 
-    # Initialize Chat History
+
     if "messages" not in st.session_state:
         st.session_state.messages = []
 
-    # Daily Report generation option
+
     if st.button("Generate Weekly Health Report"):
         report_prompt = f"""
         Analyze the following Apple Watch metrics for the last 7 days and generate a concise weekly health report.
@@ -428,38 +479,40 @@ with tab_ai:
         Context Data:
         {context_str}
         """
-        
+
         st.session_state.messages.append({"role": "user", "content": "Generate my weekly health insights report."})
-        
-        # Call local Ollama
-        client = ollama.Client(host=ollama_url)
+
         with st.spinner("Analyzing metrics and generating report..."):
             try:
-                response = client.chat(
-                    model=model_name,
-                    messages=[
-                        {"role": "system", "content": "You are a professional Health Data Coach. Offer metrics-driven insights based on data context provided."},
-                        {"role": "user", "content": report_prompt}
-                    ]
+                ai_msg = call_llm(
+                    ai_provider,
+                    "You are a professional Health Data Coach. Offer metrics-driven insights based on data context provided.",
+                    report_prompt,
+                    ollama_url,
+                    model_name,
+                    groq_key,
+                    groq_model
                 )
-                ai_msg = response['message']['content']
                 st.session_state.messages.append({"role": "assistant", "content": ai_msg})
             except Exception as e:
-                st.error(f"Error connecting to local Ollama server at {ollama_url}: {e}")
-                st.info("Check if your local Ollama is active (`ollama serve`) and the model is pulled (`ollama pull llama3`).")
+                st.error(f"Error connecting to AI provider ({ai_provider}): {e}")
+                if ai_provider == "Local Ollama":
+                    st.info("Ensure the Ollama container is active and the model has been downloaded.")
+                else:
+                    st.info("Check your API key and internet connection.")
 
-    # Render chat messages
+
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
             st.write(msg["content"])
 
-    # Chat input
+
     if prompt := st.chat_input("Ask a question about your health data..."):
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.write(prompt)
 
-        # Build full query prompt with context
+
         full_prompt = f"""
         User Health Context (Last 7 Days):
         {context_str}
@@ -467,22 +520,24 @@ with tab_ai:
         User Question: {prompt}
         """
 
-        # Call local Ollama
-        client = ollama.Client(host=ollama_url)
         with st.chat_message("assistant"):
             response_placeholder = st.empty()
             with st.spinner("Thinking..."):
                 try:
-                    response = client.chat(
-                        model=model_name,
-                        messages=[
-                            {"role": "system", "content": "You are Antigravity AI Health Coach, an expert health data assistant. Offer tailored wellness tips based on the user's data context. Keep it direct and helpful. Note: you are an AI, not a doctor."},
-                            {"role": "user", "content": full_prompt}
-                        ]
+                    ai_msg = call_llm(
+                        ai_provider,
+                        "You are Antigravity AI Health Coach, an expert health data assistant. Offer tailored wellness tips based on the user's data context. Keep it direct and helpful. Note: you are an AI, not a doctor.",
+                        full_prompt,
+                        ollama_url,
+                        model_name,
+                        groq_key,
+                        groq_model
                     )
-                    ai_msg = response['message']['content']
                     response_placeholder.write(ai_msg)
                     st.session_state.messages.append({"role": "assistant", "content": ai_msg})
                 except Exception as e:
-                    st.error(f"Error connecting to local Ollama server: {e}")
-                    st.info("Check if Ollama is running.")
+                    st.error(f"Error processing request: {e}")
+                    if ai_provider == "Local Ollama":
+                        st.info("Check if Ollama is running.")
+                    else:
+                        st.info("Check if you entered the Groq API key.")
