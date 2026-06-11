@@ -28,16 +28,6 @@ services:
       - postgres_data:/var/lib/postgresql/data
     restart: unless-stopped
 
-  ollama:
-    image: ollama/ollama:latest
-    container_name: apple_watch_ollama
-    ports:
-      - "127.0.0.1:11434:11434"
-    volumes:
-      - ollama_data:/root/.ollama
-    restart: unless-stopped
-
 volumes:
   minio_data:
   postgres_data:
-  ollama_data:

@@ -216,3 +216,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Data files (except export.zip)
+data/*
+!data/export.zip

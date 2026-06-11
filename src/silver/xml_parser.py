@@ -2,6 +2,7 @@ import os
 import shutil
 import zipfile
 import uuid
+import gc
 from datetime import datetime
 from pathlib import Path
 import lxml.etree as etree
@@ -140,7 +141,7 @@ def process_silver() -> None:
 
     record_count = 0
     workout_count = 0
-    batch_size = 20000
+    batch_size = 5000
 
     logger.info("Streaming through Apple Watch export XML...")
     for event, elem in context:
@@ -191,6 +192,7 @@ def process_silver() -> None:
                     local_root = tmp_dir / "parquet" / f"records_type={mapped_type}"
                     write_partitioned_batch(buffers[mapped_type], record_schema, local_root)
                     buffers[mapped_type] = []
+                    gc.collect()
 
         elif elem.tag == "Workout":
             start_dt = parse_date(elem.get("startDate"))
@@ -241,6 +243,7 @@ def process_silver() -> None:
                 local_root = tmp_dir / "parquet" / "workouts"
                 write_partitioned_batch(workout_buffer, workout_schema, local_root)
                 workout_buffer = []
+                gc.collect()
 
         elem.clear()
         while elem.getprevious() is not None:
@@ -254,6 +257,8 @@ def process_silver() -> None:
     if workout_buffer:
         local_root = tmp_dir / "parquet" / "workouts"
         write_partitioned_batch(workout_buffer, workout_schema, local_root)
+
+    gc.collect()
 
     logger.info(f"Parsing finished. Extracted {record_count} records and {workout_count} workouts.")
 
@@ -358,6 +363,13 @@ def process_silver() -> None:
                 except Exception as e:
                     logger.error(f"Failed to upload to {target_object_name}: {e}")
                     raise e
+
+                del new_df
+                if objects:
+                    del existing_dfs
+                    del existing_df
+                    del merged_df
+                gc.collect()
 
     logger.info(f"Silver processing complete! Uploaded tables to MinIO bucket '{settings.bucket_silver}' with date partitioning and metadata columns.")
     shutil.rmtree(tmp_dir)
